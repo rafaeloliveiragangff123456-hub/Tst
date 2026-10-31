@@ -16,7 +16,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = cfg("BS_VERSION_CODE", "1").toInt()
-        versionName = cfg("BS_VERSION_NAME", "1.0.0")
+        versionName = cfg("BS_VERSION_NAME", "1.0.20")
 
         buildConfigField("String", "SERVER_URL", "\"${cfg("BOTSYNC_URL", "https://CONFIGURE-BOTSYNC_URL.squareweb.app").trimEnd('/')}\"")
         buildConfigField("String", "TLS_PINS", "\"${cfg("BOTSYNC_PINS")}\"")
