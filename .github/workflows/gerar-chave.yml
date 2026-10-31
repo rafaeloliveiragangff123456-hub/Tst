@@ -1,0 +1,26 @@
+name: Gerar chave de assinatura
+on: workflow_dispatch
+jobs:
+  chave:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Gerar
+        run: |
+          SENHA=$(openssl rand -base64 24 | tr -d '/+=' | cut -c1-24)
+          keytool -genkeypair -keystore botsync.jks -alias botsync -keyalg RSA -keysize 4096 -validity 10000 -storepass "$SENHA" -keypass "$SENHA" -dname "CN=BotSync, O=BotSync, C=BR"
+          base64 -w0 botsync.jks > keystore_base64.txt
+          echo -n "$SENHA" > senha.txt
+          keytool -list -v -keystore botsync.jks -storepass "$SENHA" | grep "SHA1:" > sha1.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chave-botsync
+          path: |
+            botsync.jks
+            keystore_base64.txt
+            senha.txt
+            sha1.txt
+          retention-days: 1
