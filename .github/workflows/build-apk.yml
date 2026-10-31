@@ -84,6 +84,7 @@ jobs:
           path: |
             BotSync.apk
             BotSync.apk.sha256
+          retention-days: 3
 
       - name: Publicar em Releases (tags)
         if: github.ref_type == 'tag'

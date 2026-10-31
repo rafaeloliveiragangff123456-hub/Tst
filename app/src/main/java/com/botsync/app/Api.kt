@@ -25,6 +25,12 @@ object Api {
     private val rnd = SecureRandom()
     @Volatile private var skew = 0L
     private val lockRefresh = Any()
+    @Volatile private var ativa: HttpsURLConnection? = null
+
+    /** Derruba a chamada em andamento (usado quando a rede muda), para religar na hora em vez de esperar o timeout. */
+    fun cortar() {
+        try { ativa?.disconnect() } catch (e: Exception) { /* ok */ }
+    }
 
     private fun b64u(b: ByteArray): String = Base64.encodeToString(b, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
     private fun sha256hex(b: ByteArray): String = MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
@@ -43,8 +49,11 @@ object Api {
     private fun executar(metodo: String, caminho: String, corpo: JSONObject?, comAcesso: Boolean, assinar: Boolean, espera: Int): Resposta {
         val dados = (corpo?.toString() ?: "").toByteArray(Charsets.UTF_8)
         val c = URL(BuildConfig.SERVER_URL + caminho).openConnection() as HttpsURLConnection
+        var ok = false
+        ativa = c
         try {
             c.requestMethod = metodo
+            c.setRequestProperty("Connection", "keep-alive")
             c.connectTimeout = 10000
             c.readTimeout = espera
             c.instanceFollowRedirects = false
@@ -94,9 +103,12 @@ object Api {
                 saida.toString("UTF-8")
             }
             val js = if (txt.isNotEmpty()) try { JSONObject(txt) } catch (e: Exception) { null } else null
+            ok = true
             return Resposta(cod, js)
         } finally {
-            c.disconnect()
+            if (ativa === c) ativa = null
+            // sucesso: NAO desconecta, o socket TLS volta para o pool e a proxima chamada reaproveita a mesma conexao
+            if (!ok) c.disconnect()
         }
     }
 
@@ -173,6 +185,73 @@ object Api {
 
     fun estado(e: String) {
         exigir(chamar("POST", "/app/api/imap2/estado", JSONObject().put("estado", e)))
+    }
+
+    // ── chat de IA (Basic / Max / Extreme): o servidor responde; o app nunca fala com a IA direto ──
+    /** Manda a pergunta. A resposta roda em segundo plano no servidor: devolve o id do pedido para acompanhar em iaStatus(). */
+    fun iaEnviar(texto: String, modelo: String, chat: String): String {
+        val r = chamar("POST", "/app/api/ia/enviar", JSONObject().put("texto", texto).put("modelo", modelo).put("chat", chat), 20000)
+        val j = r.json
+        if (r.codigo == 202 && j != null) return j.getString("job")
+        val msg = j?.optString("erro")?.takeIf { it.isNotEmpty() } ?: "Erro ${r.codigo}"
+        throw ApiErro(r.codigo, msg, j)
+    }
+
+    /** estado = "andando" (com progresso), "pronto" (com texto, fontes, cota…) ou "erro". */
+    fun iaStatus(job: String): JSONObject {
+        val caminho = "/app/api/ia/status?job=" + job
+        var r = chamar("GET", caminho)
+        if (r.codigo == 401 && r.json?.optString("erro") == "replay") r = chamar("GET", caminho)      // nova tentativa de rede: o servidor pede outro nonce
+        return exigir(r)
+    }
+
+    /** Tokens restantes do dia (ou null se indisponível). */
+    fun iaCota(): JSONObject? = exigir(chamar("GET", "/app/api/ia/cota")).optJSONObject("cota")
+
+    /** GET sem sessão (consulta de versão): o servidor devolve só o necessário para atualizar. */
+    fun publico(caminho: String): Resposta = executar("GET", caminho, null, false, false, 8000)
+
+    /**
+     * Baixa um arquivo grande (APK) direto para o disco, sem carregar na memória.
+     * Somente HTTPS, certificado fixado (pin), sem redirecionamento, e recusa tamanho diferente do anunciado.
+     * Devolve o SHA-256 do que foi gravado.
+     */
+    fun baixar(caminho: String, destino: java.io.File, tamanho: Long, progresso: (Long) -> Unit): String {
+        if (!BuildConfig.SERVER_URL.startsWith("https://")) throw ApiErro(-4, "Servidor sem HTTPS: download bloqueado.")
+        val c = URL(BuildConfig.SERVER_URL + caminho).openConnection() as HttpsURLConnection
+        try {
+            c.requestMethod = "GET"
+            c.connectTimeout = 10000
+            c.readTimeout = 20000
+            c.instanceFollowRedirects = false
+            c.useCaches = false
+            c.setRequestProperty("User-Agent", "BotSyncApp/" + BuildConfig.VERSION_NAME + " (Android)")
+            c.setRequestProperty("X-BS-App", "1")
+            c.setRequestProperty("X-BS-Ver", BuildConfig.VERSION_CODE.toString())
+            c.connect()
+            if (!pinOk(c)) throw ApiErro(-2, "Conexão não confiável: o certificado do servidor não confere.")
+            if (c.responseCode != 200) throw ApiErro(c.responseCode, "Não foi possível baixar a atualização (código " + c.responseCode + ").")
+            val md = MessageDigest.getInstance("SHA-256")
+            var total = 0L
+            c.inputStream.use { ins ->
+                destino.outputStream().use { out ->
+                    val buf = ByteArray(32 * 1024)
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        total += n
+                        if (total > tamanho) throw ApiErro(-5, "O arquivo veio maior que o anunciado. Download cancelado.")
+                        md.update(buf, 0, n)
+                        out.write(buf, 0, n)
+                        progresso(total)
+                    }
+                }
+            }
+            if (total != tamanho) throw ApiErro(-5, "Download incompleto. Tente de novo.")
+            return md.digest().joinToString("") { "%02x".format(it) }
+        } finally {
+            c.disconnect()
+        }
     }
 
     fun sair() {

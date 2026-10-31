@@ -66,9 +66,40 @@ object Sessao {
         get() = ler("bl")
         set(v) = gravar("bl", v)
 
+    // anti-gravação (bloqueia print, gravação e espelhamento de tela). Por padrão vem ATIVADO; cada pessoa escolhe nas Configurações
+    var antiGravacao: Boolean
+        get() = ler("ag") != "0"
+        set(v) = gravar("ag", if (v) "1" else "0")
+
+    // chave e certificado do app para a depuração por Wi-Fi (o pareamento fica valendo para esta chave)
+    var adbChave: String?
+        get() = ler("ak")
+        set(v) = gravar("ak", v)
+    var adbCert: String?
+        get() = ler("ac")
+        set(v) = gravar("ac", v)
+
+    // fim da sessão de depuração por Wi-Fi (epoch em ms; 0 = sem sessão). A sessão dura 40 minutos
+    var wifiFim: Long
+        get() = ler("wf")?.toLongOrNull() ?: 0L
+        set(v) = gravar("wf", v.toString())
+
+    // manter a tela ligada enquanto a depuração por Wi-Fi estiver ativa (para a conexão não cair por descanso do aparelho)
+    var manterTela: Boolean
+        get() = ler("mt") == "1"
+        set(v) = gravar("mt", if (v) "1" else "0")
+
     fun logado(): Boolean = !dispositivo.isNullOrEmpty() && !chave.isNullOrEmpty() && !refresh.isNullOrEmpty()
 
     fun sair() {
+        val ag = antiGravacao          // a escolha de privacidade da pessoa não se perde ao sair da conta
+        val mt = manterTela
+        val ak = adbChave
+        val ac = adbCert
         sp.edit().clear().apply()
+        antiGravacao = ag
+        manterTela = mt
+        adbChave = ak
+        adbCert = ac
     }
 }

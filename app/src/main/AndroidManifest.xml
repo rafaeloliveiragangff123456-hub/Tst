@@ -8,9 +8,16 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- só vale depois de liberada uma vez pelo computador (adb shell pm grant); permite desligar a depuração sem fio sozinho -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+    <!-- Anti Cheat: mostrar o nome dos apps instalados (Android 11+ esconde os demais apps sem isto) -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- atualização automática: permite ao app instalar o APK novo dele mesmo -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <queries>
         <package android:name="com.topjohnwu.magisk" />
@@ -52,11 +59,16 @@
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
 
-        <receiver android:name=".BootReceiver" android:exported="true">
+        <!-- exported=false: só o sistema dispara (boot e fim da atualização); outros apps não conseguem acionar -->
+        <receiver android:name=".BootReceiver" android:exported="false">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+        <!-- exported=false: só o próprio app dispara o alarme dos 40 minutos da depuração por Wi-Fi -->
+        <receiver android:name=".WifiAdbReceiver" android:exported="false" />
+        <!-- recebe o código de pareamento digitado na notificação; exported=false: só o próprio app dispara -->
+        <receiver android:name=".AdbCodigoReceiver" android:exported="false" />
     </application>
 </manifest>

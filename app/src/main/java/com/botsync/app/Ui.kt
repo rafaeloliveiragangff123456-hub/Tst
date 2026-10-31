@@ -2,13 +2,19 @@ package com.botsync.app
 
 import android.content.Context
 import android.content.res.ColorStateList
+import android.graphics.Outline
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.RippleDrawable
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewOutlineProvider
 import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -70,7 +76,7 @@ fun Context.botao(t: String, primario: Boolean, acao: () -> Unit): Button {
     b.textSize = 15f
     b.setTypeface(b.typeface, Typeface.BOLD)
     b.setTextColor(if (primario) 0xFFFFFFFF.toInt() else Cor.FG)
-    val base = fundo(if (primario) Cor.ACCENT else Cor.SURFACE2, 8, if (primario) Cor.ACCENT else Cor.LINE)
+    val base = if (primario) gradiente(0xFF8B3DF0.toInt(), 0xFF6D28D9.toInt(), 12, 0xFF9F67FF.toInt()) else fundo(Cor.SURFACE2, 12, Cor.LINE)
     b.background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), base, null)
     b.stateListAnimator = null
     b.minHeight = dp(46)
@@ -115,4 +121,113 @@ fun LinearLayout.addWrap(v: View, topoDp: Int = 0, esqDp: Int = 0): View {
     lp.leftMargin = (esqDp * resources.displayMetrics.density).toInt()
     addView(v, lp)
     return v
+}
+
+
+// ── visual novo: gradientes, logo e icones vetoriais ─────────────────────────
+fun Context.gradiente(c1: Int, c2: Int, raioDp: Int, borda: Int? = null): GradientDrawable {
+    val g = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c1, c2))
+    g.cornerRadius = dp(raioDp).toFloat()
+    if (borda != null) g.setStroke(dp(1), borda)
+    return g
+}
+
+/** Fundo da tela de entrada: preto com brilho roxo no topo. */
+fun Context.brilhoFundo(): LayerDrawable {
+    val glow = GradientDrawable()
+    glow.gradientType = GradientDrawable.RADIAL_GRADIENT
+    glow.gradientRadius = dp(420).toFloat()
+    glow.setGradientCenter(0.5f, 0.1f)
+    glow.colors = intArrayOf(0x66A21CD0, 0x225B0B7A, 0x00070509)
+    return LayerDrawable(arrayOf(ColorDrawable(Cor.BG), glow))
+}
+
+/** O MESMO logo do app (Bs / BOTSYNC), recortado com cantos arredondados. */
+fun Context.logo(tamDp: Int, raioDp: Int): ImageView {
+    val v = ImageView(this)
+    v.setImageResource(R.drawable.logo_botsync)
+    v.scaleType = ImageView.ScaleType.CENTER_CROP
+    val r = dp(raioDp).toFloat()
+    v.outlineProvider = object : ViewOutlineProvider() {
+        override fun getOutline(view: View, o: Outline) { o.setRoundRect(0, 0, view.width, view.height, r) }
+    }
+    v.clipToOutline = true
+    v.layoutParams = LinearLayout.LayoutParams(dp(tamDp), dp(tamDp))
+    return v
+}
+
+fun Context.icone(res: Int, cor: Int = Cor.ACCENT_TXT): ImageView {
+    val v = ImageView(this)
+    v.setImageResource(res)
+    v.imageTintList = ColorStateList.valueOf(cor)
+    return v
+}
+
+fun Context.rotulo(t: String, cor: Int = Cor.ACCENT_TXT): TextView {
+    val v = texto(t.uppercase(), 11f, cor, true)
+    v.letterSpacing = 0.2f
+    return v
+}
+
+/** Caixa quadrada com icone (usada em listas e cartoes). */
+fun Context.caixaIcone(res: Int, tamDp: Int = 40, cor: Int = Cor.ACCENT_TXT, fundoCor: Int = Cor.ACCENT_SOFT): FrameLayout {
+    val f = FrameLayout(this)
+    f.background = fundo(fundoCor, 12)
+    f.addView(icone(res, cor), FrameLayout.LayoutParams(dp(tamDp / 2 + 2), dp(tamDp / 2 + 2), Gravity.CENTER))
+    f.layoutParams = LinearLayout.LayoutParams(dp(tamDp), dp(tamDp))
+    return f
+}
+
+fun Context.botaoIcone(res: Int, acao: () -> Unit): FrameLayout {
+    val f = FrameLayout(this)
+    f.background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), fundo(Cor.SURFACE2, 12, Cor.LINE), null)
+    f.addView(icone(res, Cor.ACCENT_TXT), FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+    f.layoutParams = LinearLayout.LayoutParams(dp(42), dp(42))
+    f.isClickable = true
+    f.setOnClickListener { acao() }
+    return f
+}
+
+/** Botao largo com icone + texto. */
+fun Context.botaoAcao(t: String, iconeRes: Int?, primario: Boolean, acao: () -> Unit): LinearLayout {
+    val l = LinearLayout(this)
+    l.orientation = LinearLayout.HORIZONTAL
+    l.gravity = Gravity.CENTER
+    l.minimumHeight = dp(52)
+    l.setPadding(dp(16), dp(10), dp(16), dp(10))
+    val base = if (primario) gradiente(0xFF8B3DF0.toInt(), 0xFF6D28D9.toInt(), 14, 0xFF9F67FF.toInt()) else fundo(Cor.SURFACE2, 14, Cor.LINE)
+    l.background = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), base, null)
+    if (iconeRes != null) {
+        val lp = LinearLayout.LayoutParams(dp(20), dp(20))
+        lp.rightMargin = dp(10)
+        l.addView(icone(iconeRes, if (primario) 0xFFFFFFFF.toInt() else Cor.ACCENT_TXT), lp)
+    }
+    l.addView(texto(t, 15f, if (primario) 0xFFFFFFFF.toInt() else Cor.FG, true))
+    l.isClickable = true
+    l.setOnClickListener { acao() }
+    return l
+}
+
+/** Caixinha de numero (ex.: Filas hoje / Faturamento). */
+fun Context.estatistica(rotuloTxt: String, valor: String): LinearLayout {
+    val c = coluna()
+    c.setPadding(dp(12), dp(10), dp(12), dp(10))
+    c.background = fundo(Cor.SURFACE2, 12, Cor.LINE)
+    c.addView(texto(rotuloTxt, 11f, Cor.MUTED))
+    c.add(texto(valor, 17f, Cor.FG, true), 2)
+    return c
+}
+
+/** Barra de progresso (0..100). */
+fun Context.barra(pct: Int): LinearLayout {
+    val p = pct.coerceIn(0, 100)
+    val l = LinearLayout(this)
+    l.orientation = LinearLayout.HORIZONTAL
+    l.weightSum = 100f
+    l.background = fundo(Cor.LINE, 4)
+    val cheio = View(this)
+    cheio.background = gradiente(0xFF8B3DF0.toInt(), 0xFFC084FC.toInt(), 4)
+    l.addView(cheio, LinearLayout.LayoutParams(0, dp(7), p.toFloat()))
+    l.addView(View(this), LinearLayout.LayoutParams(0, dp(7), (100 - p).toFloat()))
+    return l
 }

@@ -60,4 +60,8 @@ android {
 
 dependencies {
     implementation("com.google.android.gms:play-services-auth:21.2.0")   // conta Google do aparelho → token do Gmail (somente leitura)
+    // depuração por Wi-Fi dentro do app: pareamento por código + conexão (ADB)
+    implementation("com.github.MuntashirAkon:libadb-android:3.1.0")
+    implementation("com.github.MuntashirAkon:sun-security-android:1.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
 }

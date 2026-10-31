@@ -9,28 +9,21 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.PowerManager
 import android.os.SystemClock
-import android.provider.Settings
-import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
-import android.view.WindowManager
-import android.widget.ImageView
 import org.json.JSONObject
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
-import kotlin.math.abs
 
 /**
  * IMAP v2: serviço em primeiro plano que segura uma conexão (long-poll) com a rota. Quando alguém digita "pg Nome" na fila,
@@ -44,13 +37,18 @@ class Imap2Service : Service() {
         @Volatile var rodando = false
         @Volatile var estado = "Parado"
         val registro = CopyOnWriteArrayList<String>()
+        @Volatile var onlineDesde = 0L      // elapsedRealtime em que a conexao atual ficou estavel (0 = sem conexao)
+        @Volatile var ciclos = 0            // ciclos de tempo real concluidos
+        @Volatile var quedas = 0            // quedas reais apos ficar estavel
+        @Volatile var ultimoOk = 0L         // elapsedRealtime do ultimo poll bem-sucedido
+        @Volatile private var geracao = 0   // so o laco da geracao atual pode rodar (evita dois lacos disputando o mesmo poll)
         private const val CANAL = "botsync_imap2"
         private const val VIGIA_MS = 5 * 60_000L
 
         fun registrar(m: String) {
             val h = SimpleDateFormat("HH:mm:ss", Locale("pt", "BR")).format(Date())
             registro.add(0, "$h  $m")
-            while (registro.size > 30) registro.removeAt(registro.size - 1)
+            while (registro.size > 200) registro.removeAt(registro.size - 1)
         }
 
         private fun intentServico(ctx: Context) = Intent(ctx, Imap2Service::class.java)
@@ -89,89 +87,25 @@ class Imap2Service : Service() {
     private var wl: PowerManager.WakeLock? = null
     private var wifi: WifiManager.WifiLock? = null
     private var ultimoTextoNotif = ""
-    private var bolha: View? = null
+    private var flut: Flutuante? = null
     private val principal = Handler(Looper.getMainLooper())
 
-    /** Bolinha flutuante de 32dp com o símbolo do app: mantém o app "aberto" para o Android. Toque abre o app; arraste para mover. */
+    /** Flutuante com o logo: 1 toque abre o menu (Terminal), 2o toque fecha. Arraste para mover. */
     private fun mostrarBolha() {
         principal.post {
-            if (bolha != null || !Settings.canDrawOverlays(this)) return@post
-            try {
-                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                val d = resources.displayMetrics.density
-                val tam = (32 * d).toInt()
-                val v = ImageView(this)
-                val fundo = GradientDrawable()
-                fundo.shape = GradientDrawable.OVAL
-                fundo.setColor(0xFF7C3AED.toInt())
-                fundo.setStroke((2 * d).toInt(), 0xFFFBBF24.toInt())
-                v.background = fundo
-                v.setImageResource(R.drawable.ic_stat)
-                val pad = (6 * d).toInt()
-                v.setPadding(pad, pad, pad, pad)
-                v.alpha = 0.92f
-                val lp = WindowManager.LayoutParams(
-                    tam, tam, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                    PixelFormat.TRANSLUCENT
-                )
-                lp.gravity = Gravity.TOP or Gravity.START
-                val salva = Sessao.bolha?.split(",")
-                lp.x = salva?.getOrNull(0)?.toIntOrNull() ?: (8 * d).toInt()
-                lp.y = salva?.getOrNull(1)?.toIntOrNull() ?: (140 * d).toInt()
-                v.setOnTouchListener(object : View.OnTouchListener {
-                    var ix = 0
-                    var iy = 0
-                    var tx = 0f
-                    var ty = 0f
-                    var moveu = false
-                    override fun onTouch(view: View, e: MotionEvent): Boolean {
-                        when (e.action) {
-                            MotionEvent.ACTION_DOWN -> { ix = lp.x; iy = lp.y; tx = e.rawX; ty = e.rawY; moveu = false; return true }
-                            MotionEvent.ACTION_MOVE -> {
-                                val dx = (e.rawX - tx).toInt()
-                                val dy = (e.rawY - ty).toInt()
-                                if (abs(dx) > 8 || abs(dy) > 8) moveu = true
-                                lp.x = ix + dx
-                                lp.y = iy + dy
-                                try { wm.updateViewLayout(view, lp) } catch (x: Exception) { /* ok */ }
-                                return true
-                            }
-                            MotionEvent.ACTION_UP -> {
-                                if (moveu) Sessao.bolha = lp.x.toString() + "," + lp.y.toString()
-                                else abrirApp()
-                                return true
-                            }
-                        }
-                        return false
-                    }
-                })
-                wm.addView(v, lp)
-                bolha = v
-            } catch (e: Exception) {
-                // sem permissão de sobreposição: segue sem a bolinha
-            }
+            if (flut == null) flut = Flutuante(this)
+            flut?.mostrar()
         }
     }
 
     private fun esconderBolha() {
-        val v = bolha ?: return
-        bolha = null
-        try { (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v) } catch (e: Exception) { /* ok */ }
+        flut?.esconder()
+        flut = null
     }
 
     /** Anel verde = online; amarelo = reconectando. */
     private fun corBolha(online: Boolean) {
-        principal.post {
-            val g = bolha?.background as? GradientDrawable ?: return@post
-            g.setStroke((2 * resources.displayMetrics.density).toInt(), if (online) 0xFF34D399.toInt() else 0xFFFBBF24.toInt())
-        }
-    }
-
-    private fun abrirApp() {
-        try {
-            startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP))
-        } catch (e: Exception) { /* sem permissão para abrir agora */ }
+        principal.post { flut?.status(online) }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -188,11 +122,10 @@ class Imap2Service : Service() {
         if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) else startForeground(1, n)
         segurarEnergia()
         agendarVigia(this)
+        observarRede()
         mostrarBolha()
-        if (fio?.isAlive != true) {
-            rodando = true
-            fio = Thread({ laco() }, "imap2").also { it.isDaemon = true; it.start() }
-        }
+        iniciarFio()
+        iniciarVigilante()
         return START_STICKY
     }
 
@@ -204,6 +137,13 @@ class Imap2Service : Service() {
 
     override fun onDestroy() {
         rodando = false
+        geracao++                       // o laco desta instancia deve sair assim que o poll voltar
+        Thread { Api.cortar() }.start() // destrava o poll em andamento na hora (fora da thread principal)
+        vigilanteAtivo = false
+        onlineDesde = 0L
+        try { pool.shutdownNow() } catch (e: Exception) { /* ok */ }
+        try { redeCb?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } } catch (e: Exception) { /* ok */ }
+        redeCb = null
         esconderBolha()
         estado = "Parado"
         try { if (wl?.isHeld == true) wl?.release() } catch (e: Exception) { /* ok */ }
@@ -231,11 +171,19 @@ class Imap2Service : Service() {
 
     private fun notificacao(texto: String): Notification {
         val abrir = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        // na tela bloqueada aparece só o texto genérico: o estado detalhado fica oculto
+        val publica = Notification.Builder(this, CANAL)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle("BotSync")
+            .setContentText("Monitoramento ativo")
+            .build()
         return Notification.Builder(this, CANAL)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle("BotSync · IMAP v2")
             .setContentText(texto)
             .setOngoing(true)
+            .setVisibility(Notification.VISIBILITY_PRIVATE)
+            .setPublicVersion(publica)
             .setContentIntent(abrir)
             .build()
     }
@@ -245,18 +193,86 @@ class Imap2Service : Service() {
         corBolha(texto.startsWith("Online"))
         if (texto != ultimoTextoNotif) {
             ultimoTextoNotif = texto
+            registrar(texto)
             try { getSystemService(NotificationManager::class.java).notify(1, notificacao(texto)) } catch (e: Exception) { /* ok */ }
         }
     }
 
-    private fun dormir(ms: Long) {
-        try { Thread.sleep(ms) } catch (e: InterruptedException) { /* acorda */ }
+    private var ultimaUnica = ""
+
+    /** Registra so quando a mensagem muda (evita encher o terminal durante queda de rede). */
+    private fun registrarUnico(m: String) {
+        if (m != ultimaUnica) { ultimaUnica = m; registrar(m) }
     }
 
-    private fun laco() {
-        var espera = 1000L
+    private fun dormir(ms: Long) {
+        dormindo = true
+        try { Thread.sleep(ms) } catch (e: InterruptedException) { /* acorda */ } finally { dormindo = false }
+    }
+
+    private val pool = java.util.concurrent.Executors.newFixedThreadPool(3) { r -> Thread(r, "imap2-job").also { it.isDaemon = true } }
+    private var vigilanteAtivo = false
+
+    /** Thread do tempo real: se algo derrubar o laco (ate erro grave), ele recomeca sozinho. */
+    private fun iniciarFio() {
+        if (fio?.isAlive == true) return
+        val minha = ++geracao          // invalida qualquer laco antigo (inclusive de uma instancia anterior do servico)
+        rodando = true
         registrar("Serviço iniciado")
-        while (rodando) {
+        fio = Thread({
+            while (rodando && minha == geracao) {
+                try {
+                    laco(minha)
+                } catch (t: Throwable) {
+                    registrar("Erro interno no tempo real: " + t.javaClass.simpleName + " - reiniciando")
+                    try { Thread.sleep(1_500L) } catch (x: InterruptedException) { /* ok */ }
+                }
+            }
+        }, "imap2").also { it.isDaemon = true; it.start() }
+    }
+
+    /** Vigilante: conexao "online" mas sem nenhum poll concluido ha 45 s = socket travado, derruba e religa; laco morto = recria. */
+    private fun iniciarVigilante() {
+        if (vigilanteAtivo) return
+        vigilanteAtivo = true
+        principal.postDelayed(object : Runnable {
+            override fun run() {
+                if (!vigilanteAtivo) return
+                if (rodando && Sessao.imapAtivo) {
+                    val agora = SystemClock.elapsedRealtime()
+                    if (fio?.isAlive != true) iniciarFio()
+                    else if (falhas == 0 && ultimoOk > 0L && agora - ultimoOk > 45_000L) {
+                        registrar("Vigilante: conexão travada, religando")
+                        ultimoOk = agora
+                        Api.cortar()
+                    }
+                }
+                principal.postDelayed(this, 10_000L)
+            }
+        }, 10_000L)
+    }
+
+    // estado da conexao em tempo real
+    private var falhas = 0
+    private var offlineDesde = 0L
+    private var conectadoDesde = 0L
+    @Volatile private var dormindo = false
+
+    /** Falha de conexao: tenta de novo quase na hora e so mostra "Reconectando" se a queda for real (3 falhas ou 12 s). */
+    private fun falhou(texto: String, minimo: Long = 0L): Long {
+        falhas++
+        val agora = SystemClock.elapsedRealtime()
+        if (conectadoDesde != 0L) { conectadoDesde = 0L; onlineDesde = 0L; quedas++; offlineDesde = agora }
+        else if (offlineDesde == 0L) offlineDesde = agora
+        if (falhas >= 3 || agora - offlineDesde >= 12_000L) definirEstado(texto)
+        return maxOf(minimo, minOf(300L shl minOf(falhas - 1, 4), 4_000L)) + (Math.random() * 250).toLong()
+    }
+
+    private fun laco(minha: Int) {
+        var leitor: GmailLeitor? = null
+        var leitorConta = ""
+        var ultimoBatimento = SystemClock.elapsedRealtime()
+        while (rodando && minha == geracao) {
             val gmail = Sessao.imapGmail
             if (!Sessao.logado() || gmail.isNullOrEmpty()) {
                 definirEstado("Sessão encerrada — entre de novo no app")
@@ -264,36 +280,114 @@ class Imap2Service : Service() {
             }
             try {
                 agendarVigia(applicationContext)
-                val leitor = GmailLeitor(applicationContext, android.accounts.Account(gmail, "com.google"))
+                if (leitor == null || leitorConta != gmail) {
+                    leitor = GmailLeitor(applicationContext, android.accounts.Account(gmail, "com.google"))
+                    leitorConta = gmail
+                }
                 val jobs = Api.poll()
+                val agora = SystemClock.elapsedRealtime()
+                ultimoOk = agora
+                if (conectadoDesde == 0L) {
+                    conectadoDesde = agora
+                    onlineDesde = agora
+                    ultimoBatimento = agora
+                    val queda = if (offlineDesde > 0L) (agora - offlineDesde) / 1000 else -1L
+                    registrar(if (queda >= 3L) "Tempo real: conexão restabelecida após " + queda + "s" else "Tempo real: conectado ao servidor")
+                    offlineDesde = 0L
+                }
+                falhas = 0
+                ultimaUnica = ""
                 definirEstado("Online — aguardando consultas")
-                espera = 1000L
-                for (i in 0 until jobs.length()) processar(leitor, jobs.getJSONObject(i))
+                ciclos++
+                if (jobs.length() == 0 && agora - ultimoBatimento >= 5 * 60_000L) {
+                    ultimoBatimento = agora
+                    registrar("Tempo real: conexão estável há " + ((agora - conectadoDesde) / 60_000L) + " min (" + ciclos + " ciclos)")
+                }
+                val ativo = leitor!!
+                // cada consulta roda em paralelo; o laco ja volta ao poll (nada fica esperando o Gmail)
+                for (i in 0 until jobs.length()) {
+                    val job = jobs.getJSONObject(i)
+                    try {
+                        pool.execute {
+                            try { processar(ativo, job) } catch (x: Exception) { registrarUnico("Erro ao processar consulta: " + x.javaClass.simpleName) }
+                        }
+                    } catch (x: Exception) {
+                        try { processar(ativo, job) } catch (y: Exception) { registrarUnico("Erro ao processar consulta: " + y.javaClass.simpleName) }
+                    }
+                }
             } catch (e: ApiErro) {
                 when (e.codigo) {
                     409 -> { definirEstado("Vínculo perdido — abra o app e selecione o Gmail de novo"); dormir(15_000L) }
-                    426 -> { definirEstado("Atualize o aplicativo"); dormir(60_000L) }
+                    426 -> {
+                        definirEstado("Atualização obrigatória — toque na notificação")
+                        avisarAtualizacao()
+                        dormir(60_000L)
+                    }
                     -2 -> { definirEstado("Certificado do servidor não confere"); dormir(30_000L) }
                     404 -> {
                         // aparelho desconhecido pelo servidor: confirma pela renovação (ela mesma desloga se foi revogado)
                         try { Api.renovar(true) } catch (x: Exception) { /* verificado no topo do laço */ }
+                        // 404 = o servidor nao reconhece o aparelho (cada tentativa conta como suspeita la): espera bem mais
+                        registrarUnico("Servidor respondeu código 404")
                         definirEstado("Reconectando…")
-                        dormir(15_000L)
+                        dormir(falhou("Reconectando…", 15_000L))
                     }
-                    else -> { definirEstado("Reconectando…"); dormir(espera); espera = minOf(espera * 2, 5_000L) }
+                    else -> {
+                        registrarUnico("Servidor respondeu código " + e.codigo)
+                        dormir(falhou("Reconectando…", if (e.codigo == 429 || e.codigo == 503) 6_000L else 0L))
+                    }
                 }
             } catch (e: IOException) {
-                definirEstado("Sem conexão — tentando de novo")
-                dormir(espera)
-                espera = minOf(espera * 2, 5_000L)
+                registrarUnico("Rede: " + e.javaClass.simpleName)
+                dormir(falhou("Sem conexão — tentando de novo"))
             } catch (e: Exception) {
-                definirEstado("Reconectando…")
-                dormir(espera)
-                espera = minOf(espera * 2, 5_000L)
+                dormir(falhou("Reconectando…"))
             }
         }
-        rodando = false
-        stopSelf()
+        // so encerra o servico se ESTE ainda e o laco vigente (um laco antigo saindo nao pode derrubar o novo)
+        if (minha == geracao) {
+            rodando = false
+            stopSelf()
+        }
+    }
+
+    // ── rede: ao trocar Wi-Fi/dados ou voltar de uma queda, derruba o socket morto e religa na hora ──
+    private var redeCb: ConnectivityManager.NetworkCallback? = null
+    private var redeAtual: Network? = null
+    private var perdeuRede = false
+
+    private fun observarRede() {
+        if (redeCb != null) return
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    val mudou = redeAtual != null && redeAtual != network
+                    redeAtual = network
+                    if (perdeuRede || mudou) {
+                        perdeuRede = false
+                        registrar("Rede mudou — religando o tempo real")
+                        Api.cortar()
+                        if (dormindo) fio?.interrupt()
+                    }
+                }
+
+                override fun onLost(network: Network) {
+                    if (redeAtual == network) perdeuRede = true
+                }
+            }
+            cm.registerDefaultNetworkCallback(cb)
+            redeCb = cb
+        } catch (e: Exception) {
+            // sem observador de rede: segue só com as tentativas automáticas
+        }
+    }
+
+    /** O servidor barrou esta versão (426): busca os dados da nova e mostra a notificação de atualização (uma vez por versão). */
+    private fun avisarAtualizacao() {
+        try {
+            Atualizador.verificar(applicationContext)?.let { Atualizador.notificarObrigatoria(applicationContext, it) }
+        } catch (e: Exception) { /* sem rede agora: tenta de novo no próximo ciclo */ }
     }
 
     private fun processar(leitor: GmailLeitor, job: JSONObject) {
@@ -303,9 +397,10 @@ class Imap2Service : Service() {
         val conhecidos = HashSet<String>()
         job.optJSONArray("conhecidos")?.let { a -> for (i in 0 until a.length()) conhecidos.add(a.getString(i)) }
         try {
+            registrar("Consulta recebida (" + froms.size + " remetente(s)) - lendo Gmail")
             val itens = leitor.buscar(froms, job.optInt("dias", 2), job.optInt("max", 40), conhecidos)
             Api.enviarEmails(id, itens, true, null)
-            registrar("Consulta da fila: " + itens.size + " e-mail(s) novo(s) do banco")
+            registrar("Gmail: " + itens.size + " e-mail(s) novo(s) do banco enviados ao servidor")
         } catch (e: GmailErro) {
             registrar("Gmail: " + e.message)
             try { Api.estado(if (e.tipo == "auth") "auth" else "erro") } catch (x: Exception) { /* segue */ }
