@@ -130,13 +130,15 @@ object WifiDebug {
         if (fim == 0L) return
         val f = AdbWifi.fase
         val vivo = f == AdbWifi.Fase.CONECTADO || f == AdbWifi.Fase.CONECTANDO || f == AdbWifi.Fase.PAREANDO
-        if (System.currentTimeMillis() >= fim || !vivo || !ligada(ctx)) encerrar(ctx)
+        // conexão com OUTRO aparelho não depende da depuração sem fio deste celular
+        if (System.currentTimeMillis() >= fim || !vivo || (!AdbWifi.remoto && !ligada(ctx))) encerrar(ctx)
     }
 
     /** Fecha a conexão do app e desliga a depuração sem fio. Devolve false se não deu para desligar sozinho. */
     fun encerrar(ctx: Context): Boolean {
+        val eraRemoto = AdbWifi.remoto
         AdbWifi.desconectar()
-        val desligou = if (ligada(ctx)) desligar(ctx) else true
+        val desligou = if (!eraRemoto && ligada(ctx)) desligar(ctx) else true
         limpar(ctx)
         return desligou
     }
@@ -175,8 +177,9 @@ object WifiDebug {
     fun expirou(ctx: Context) {
         val fim = Sessao.wifiFim
         if (fim > System.currentTimeMillis() + 5000) { agendar(ctx, fim); return }
+        val eraRemoto = AdbWifi.remoto
         AdbWifi.desconectarAgora()
-        val desligou = if (ligada(ctx)) desligar(ctx) else true
+        val desligou = if (!eraRemoto && ligada(ctx)) desligar(ctx) else true
         limpar(ctx)
         if (!desligou) avisarEsgotado(ctx)
     }
@@ -287,7 +290,7 @@ fun Activity.cartaoWifi(): View {
     val remotoRow = linha()
     val remotoTxt = coluna()
     remotoTxt.addView(texto("Parear com outro aparelho", 15f, Cor.FG, true))
-    remotoTxt.add(texto("Para um aparelho diferente deste, longe: peça para a pessoa deixar a tela de pareamento aberta e informe o IP e as portas que aparecem nela.", 12f, Cor.MUTED), 2)
+    remotoTxt.add(texto("Para um aparelho diferente deste, na MESMA rede Wi-Fi: deixe a tela de pareamento aberta nele e informe o IP e as portas que aparecem lá.", 12f, Cor.MUTED), 2)
     val lpRemotoTxt = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
     lpRemotoTxt.rightMargin = dp(12)
     remotoRow.addView(remotoTxt, lpRemotoTxt)
@@ -438,7 +441,7 @@ fun Activity.cartaoWifi(): View {
             !e.suportado -> "A depuração por Wi-Fi precisa do Android 11 ou mais novo."
             fase == AdbWifi.Fase.ERRO || ocupado -> AdbWifi.mensagem
             e.conectada -> "Tudo certo: o app está conectado por 40 minutos e desconecta sozinho."
-            remoto -> "No OUTRO celular: abra \"Depuração sem fio\" e \"Parear dispositivo com código\". Informe abaixo o IP e a porta de pareamento mostrados lá, o código de 6 dígitos, e a porta de conexão (do topo da tela \"Depuração sem fio\" dele). Os dois aparelhos precisam conseguir se enxergar na rede."
+            remoto -> "No OUTRO celular: abra \"Depuração sem fio\" e \"Parear dispositivo com código\". Informe o IP e a porta de PAREAMENTO (da janela do código), o código de 6 dígitos e a porta de CONEXÃO (do topo da tela \"Depuração sem fio\" dele: são portas diferentes). Os dois aparelhos precisam estar na mesma rede Wi-Fi, sem VPN."
             !e.devOpcoes -> "Primeiro libere as Opções do desenvolvedor: em Sobre o telefone, toque 7 vezes em Número da versão."
             e.ip == null -> "Conecte o celular a uma rede Wi-Fi."
             !e.ligada -> "Toque em \"Abrir Depuração sem fio\" e ligue a chave. Depois toque em \"Parear dispositivo com código de pareamento\": o código de 6 dígitos aparece ali."
@@ -459,7 +462,9 @@ fun Activity.cartaoWifi(): View {
                 act.manterTelaAgora()
                 montar()
             }, 14)
-        } else if (remoto && !ocupado) {
+        } else if (ocupado) {
+            dinamico.add(botaoAcao("Cancelar", R.drawable.ic_fechar, false) { AdbWifi.cancelar() }, 14)
+        } else if (remoto) {
             dinamico.add(campoIp, 14)
             val lp = linha()
             lp.addView(campoPortaParear, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
