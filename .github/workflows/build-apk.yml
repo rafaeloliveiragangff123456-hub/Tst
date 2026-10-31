@@ -58,6 +58,17 @@ jobs:
             echo "- **SHA-1:** \`$SHA1\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Calcular versão do APK
+        run: |
+          VERSION_CODE=$((GITHUB_RUN_NUMBER + 12))
+          VERSION_NAME="1.0.${VERSION_CODE}"
+
+          echo "BS_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "BS_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+
+          echo "Versão: $VERSION_NAME"
+          echo "Version Code: $VERSION_CODE"
+
       - name: Compilar release
         env:
           BOTSYNC_URL: ${{ vars.BOTSYNC_URL }}
@@ -66,17 +77,14 @@ jobs:
           BS_KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
           BS_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           BS_KEY_PASS: ${{ secrets.KEY_PASSWORD }}
-
-          # Próximo build será 1.0.18 / versionCode 18.
-          # Depois: 1.0.19 / 19, 1.0.20 / 20...
-          BS_VERSION_CODE: ${{ github.run_number + 12 }}
-          BS_VERSION_NAME: ${{ format('1.0.{0}', github.run_number + 12) }}
-
+          BS_VERSION_CODE: ${{ env.BS_VERSION_CODE }}
+          BS_VERSION_NAME: ${{ env.BS_VERSION_NAME }}
         run: |
           if [ -z "$BOTSYNC_URL" ]; then
             echo "::error::Defina a variável BOTSYNC_URL."
             exit 1
           fi
+
           gradle --no-daemon :app:assembleRelease
 
       - name: Verificar assinatura do APK
