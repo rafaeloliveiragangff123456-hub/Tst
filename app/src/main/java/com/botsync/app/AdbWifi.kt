@@ -17,7 +17,14 @@ import android.os.Looper
 import android.util.Base64
 import io.github.muntashirakon.adb.AbsAdbConnectionManager
 import java.io.ByteArrayInputStream
+import java.net.ConnectException
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
+import java.io.EOFException
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.PrivateKey
@@ -28,7 +35,12 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Date
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Callable
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.FutureTask
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -79,6 +91,9 @@ class BotAdb private constructor() : AbsAdbConnectionManager() {
     }
 }
 
+/** Mensagem pronta para mostrar à pessoa (diferente de uma falha técnica da biblioteca). */
+private class Aviso(msg: String) : Exception(msg)
+
 /**
  * Pareamento por código e conexão do app com a depuração sem fio do próprio aparelho.
  * Fluxo: a pessoa liga a "Depuração sem fio", abre "Parear dispositivo com código" e digita os 6 dígitos no campo do app
@@ -98,6 +113,11 @@ object AdbWifi {
         private set
     @Volatile var mensagem: String = ""
         private set
+    /** true quando a conexão atual é com OUTRO aparelho (aí o estado da depuração sem fio DESTE celular não importa). */
+    @Volatile var remoto: Boolean = false
+        private set
+    @Volatile private var cancelado = false
+    @Volatile private var tarefaAtual: FutureTask<*>? = null
 
     private val principal = Handler(Looper.getMainLooper())
     private val ouvintes = CopyOnWriteArrayList<() -> Unit>()
@@ -170,6 +190,63 @@ object AdbWifi {
         return achado.get()
     }
 
+    // ── utilidades: limite de tempo, teste de rede e mensagens claras ────────
+    /** Roda o bloco com limite de tempo. Sem isso, a biblioteca pode ficar presa para sempre em "Conectando…". */
+    private fun <T> comLimite(ms: Long, etapa: String, bloco: () -> T): T {
+        val tarefa = FutureTask(Callable { bloco() })
+        tarefaAtual = tarefa
+        val t = Thread(tarefa, "adb-$etapa")
+        t.isDaemon = true
+        t.start()
+        try {
+            return tarefa.get(ms, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            tarefa.cancel(true)
+            t.interrupt()
+            fecharSocket()
+            throw TimeoutException(etapa)
+        } catch (e: ExecutionException) {
+            val causa = e.cause ?: e
+            throw (causa as? Exception ?: RuntimeException(causa))
+        } finally {
+            if (tarefaAtual === tarefa) tarefaAtual = null
+        }
+    }
+
+    /** Testa só a rede (TCP) até IP:porta. Devolve null se responde, ou o motivo. Não gasta o código de pareamento. */
+    private fun semResposta(host: String, porta: Int, ms: Int): String? = try {
+        Socket().use { it.connect(InetSocketAddress(host, porta), ms) }
+        null
+    } catch (e: SocketTimeoutException) { "não respondeu a tempo"
+    } catch (e: UnknownHostException) { "IP inválido"
+    } catch (e: ConnectException) { if ((e.message ?: "").contains("refused", true)) "porta fechada" else (e.message ?: "sem rota")
+    } catch (e: Exception) { e.javaClass.simpleName + (e.message?.let { ": $it" } ?: "") }
+
+    /** Separa um "192.168.0.5:37123" colado no campo de IP. */
+    private fun separarHost(bruto: String): Pair<String, Int> {
+        val t = bruto.trim().removePrefix("http://").removePrefix("https://").trimEnd('/').filterNot { it.isWhitespace() }
+        val i = t.lastIndexOf(':')
+        return if (i > 0 && t.indexOf(':') == i) Pair(t.substring(0, i), t.substring(i + 1).toIntOrNull() ?: 0) else Pair(t, 0)
+    }
+
+    private fun traduzir(e: Throwable, etapa: String): String {
+        val raiz = generateSequence(e) { it.cause }.last()
+        val msg = raiz.message ?: ""
+        return when {
+            e is CancellationException -> "Cancelado."
+            e is TimeoutException || raiz is SocketTimeoutException ->
+                if (etapa == "parear") "O pareamento ficou sem resposta. Confira: a tela \"Parear dispositivo com código\" precisa continuar ABERTA no outro celular, a porta de pareamento é a que aparece nela (não a do topo) e o código é o que está na tela agora."
+                else "A conexão ficou sem resposta. Confira a porta de conexão: é a do topo da tela \"Depuração sem fio\" (muda toda vez que liga)."
+            raiz is UnknownHostException -> "IP inválido."
+            raiz is ConnectException -> "Porta fechada ou inalcançável ($msg). Veja se a porta mudou: ela muda quando a tela de pareamento é reaberta."
+            raiz is UnsatisfiedLinkError -> "A biblioteca nativa do ADB não carregou: $msg"
+            raiz is SSLException || raiz is EOFException || msg.contains("closed", true) || msg.contains("reset", true) ->
+                if (etapa == "parear") "O outro celular encerrou o pareamento. Código errado/vencido, ou a porta de pareamento está trocada com a de conexão. Reabra a tela de pareamento e use o código novo."
+                else "O outro celular fechou a conexão. Pareie de novo (o pareamento pode ter sido removido) e confira a porta de conexão."
+            else -> "Falha ao $etapa: ${raiz.javaClass.simpleName}" + (if (msg.isNotEmpty()) " — $msg" else "")
+        }
+    }
+
     // ── pareamento e conexão ──────────────────────────────────────────────────
     /** Pareia com o código e conecta. Bloqueia: chame fora da thread principal. */
     fun executarPareamento(ctx: Context, codigo: String) {
@@ -177,16 +254,19 @@ object AdbWifi {
         val c = codigo.filter { it.isDigit() }
         if (c.length != 6) { mudar(Fase.ERRO, "O código tem 6 dígitos."); return }
         if (!trabalhando.compareAndSet(false, true)) return
+        cancelado = false
+        remoto = false
         try {
             mudar(Fase.PAREANDO, "Procurando a tela de pareamento…")
             val alvo = descobrir(app, TIPO_PAREAR, 6000)
-                ?: throw Exception("Não achei o pareamento. Deixe aberta a tela \"Parear dispositivo com código\" e tente de novo.")
+                ?: throw Aviso("Não achei o pareamento. Deixe aberta a tela \"Parear dispositivo com código\" e tente de novo.")
             mudar(Fase.PAREANDO, "Pareando…")
-            val r: Any? = BotAdb.obter().pair(alvo.first, alvo.second, c)
-            if (r == false) throw Exception("Código recusado. Confira os 6 dígitos: ele muda a cada vez.")
+            val m = BotAdb.obter()
+            val r: Any? = comLimite(20000, "parear") { m.pair(alvo.first, alvo.second, c) }
+            if (r == false) throw Aviso("Código recusado. Confira os 6 dígitos: ele muda a cada vez.")
             conectarInterno(app)
         } catch (e: Exception) {
-            mudar(Fase.ERRO, e.message ?: "Falha no pareamento.")
+            if (cancelado) mudar(Fase.OCIOSO) else mudar(Fase.ERRO, if (e is Aviso) (e.message ?: "Falha no pareamento.") else traduzir(e, "parear"))
         } finally {
             trabalhando.set(false)
         }
@@ -196,33 +276,71 @@ object AdbWifi {
         Thread { executarPareamento(ctx, codigo) }.start()
     }
 
+    /** Tenta conectar até 3 vezes: logo após parear, o outro aparelho às vezes demora um instante a aceitar a chave nova. */
+    private fun conectarComTentativas(m: BotAdb, h: String, porta: Int) {
+        var ultimo: Throwable? = null
+        for (i in 1..3) {
+            if (cancelado) throw CancellationException()
+            try {
+                val r: Any? = comLimite(15000, "conectar") { m.connect(h, porta) }
+                if (r != false) return
+                ultimo = Exception("recusado")
+            } catch (e: Exception) {
+                if (cancelado) throw e
+                ultimo = e
+            }
+            if (i < 3) {
+                mudar(Fase.CONECTANDO, "Conectando a $h:$porta… (tentativa ${i + 1} de 3)")
+                try { Thread.sleep(1500) } catch (e: InterruptedException) { /* segue */ }
+            }
+        }
+        throw Aviso(
+            if (ultimo != null && ultimo.message != "recusado") traduzir(ultimo, "conectar")
+            else "Pareou, mas o outro celular recusou a conexão. Confira a porta de conexão (topo da tela \"Depuração sem fio\")."
+        )
+    }
+
     /**
-     * Pareia e conecta com OUTRO aparelho (longe, numa rede acessível), informando IP e portas na mão —
+     * Pareia e conecta com OUTRO aparelho (na MESMA rede), informando IP e portas na mão —
      * não depende da descoberta por mDNS, que só acha o pareamento deste próprio aparelho.
      * host/portas vêm da tela "Parear dispositivo com código" (porta de pareamento) e do topo da tela
      * "Depuração sem fio" (IP e porta de conexão) do OUTRO celular.
      */
     fun executarPareamentoRemoto(ctx: Context, host: String, portaParear: Int, codigo: String, portaConectar: Int) {
         val app = ctx.applicationContext
-        val h = host.trim()
+        val (h, portaNoIp) = separarHost(host)
+        val pc = if (portaConectar > 0) portaConectar else portaNoIp
         val c = codigo.filter { it.isDigit() }
         if (h.isEmpty()) { mudar(Fase.ERRO, "Informe o IP do outro aparelho."); return }
         if (c.length != 6) { mudar(Fase.ERRO, "O código tem 6 dígitos."); return }
-        if (portaParear <= 0 || portaConectar <= 0) { mudar(Fase.ERRO, "Informe a porta de pareamento e a de conexão."); return }
+        if (portaParear <= 0 || pc <= 0) { mudar(Fase.ERRO, "Informe a porta de pareamento e a de conexão."); return }
+        if (portaParear == pc) { mudar(Fase.ERRO, "A porta de pareamento e a de conexão são diferentes. Confira as duas."); return }
         if (!trabalhando.compareAndSet(false, true)) return
+        cancelado = false
+        remoto = true
         try {
-            mudar(Fase.PAREANDO, "Pareando com $h…")
+            // 1) só rede: se nem a porta de conexão responde, o problema é IP/rede, não código nem porta trocada
+            mudar(Fase.PAREANDO, "Testando se $h:$pc responde…")
+            val falha = semResposta(h, pc, 5000)
+            if (falha != null) throw Aviso(
+                "Não consegui falar com $h:$pc ($falha). Os dois celulares precisam estar na MESMA rede Wi-Fi (sem \"isolamento de clientes\" no roteador, sem dados móveis nem VPN), a Depuração sem fio do outro precisa estar ligada, e a porta de conexão é a do topo da tela \"Depuração sem fio\" dele."
+            )
+            if (cancelado) throw CancellationException()
+            // 2) pareamento
+            mudar(Fase.PAREANDO, "Pareando com $h:$portaParear…")
             val m = BotAdb.obter()
-            val rp: Any? = m.pair(h, portaParear, c)
-            if (rp == false) throw Exception("Código recusado. Confira os 6 dígitos: ele muda a cada vez.")
-            mudar(Fase.CONECTANDO, "Conectando a $h…")
-            val rc: Any? = m.connect(h, portaConectar)
-            if (rc == false) throw Exception("Pareou, mas não consegui conectar. Confira a porta de conexão.")
+            val rp: Any? = comLimite(20000, "parear") { m.pair(h, portaParear, c) }
+            if (rp == false) throw Aviso("Código recusado. Confira os 6 dígitos: ele muda a cada vez.")
+            // 3) conexão
+            mudar(Fase.CONECTANDO, "Conectando a $h:$pc…")
+            try { Thread.sleep(1200) } catch (e: InterruptedException) { /* segue */ }
+            conectarComTentativas(m, h, pc)
             WifiDebug.iniciarSessao(app)
-            liberarDesligarSozinho(app, m)
             mudar(Fase.CONECTADO)
         } catch (e: Exception) {
-            mudar(Fase.ERRO, e.message ?: "Falha no pareamento remoto. Confira se os dois aparelhos conseguem se enxergar na rede.")
+            remoto = false
+            fecharSocket()
+            if (cancelado) mudar(Fase.OCIOSO) else mudar(Fase.ERRO, if (e is Aviso) (e.message ?: "Falha no pareamento remoto.") else traduzir(e, "parear"))
         } finally {
             trabalhando.set(false)
         }
@@ -235,21 +353,26 @@ object AdbWifi {
     /** Conecta a um aparelho remoto já pareado antes, com IP e porta de conexão informados na mão. */
     fun conectarRemoto(ctx: Context, host: String, portaConectar: Int) {
         val app = ctx.applicationContext
-        val h = host.trim()
+        val (h, portaNoIp) = separarHost(host)
+        val pc = if (portaConectar > 0) portaConectar else portaNoIp
         if (h.isEmpty()) { mudar(Fase.ERRO, "Informe o IP do outro aparelho."); return }
-        if (portaConectar <= 0) { mudar(Fase.ERRO, "Informe a porta de conexão."); return }
+        if (pc <= 0) { mudar(Fase.ERRO, "Informe a porta de conexão."); return }
         if (!trabalhando.compareAndSet(false, true)) return
+        cancelado = false
+        remoto = true
         Thread {
             try {
-                mudar(Fase.CONECTANDO, "Conectando a $h…")
-                val m = BotAdb.obter()
-                val r: Any? = m.connect(h, portaConectar)
-                if (r == false) throw Exception("Não consegui conectar. Confira o IP e a porta.")
+                mudar(Fase.CONECTANDO, "Testando se $h:$pc responde…")
+                val falha = semResposta(h, pc, 5000)
+                if (falha != null) throw Aviso("Não consegui falar com $h:$pc ($falha). Confira o IP, a porta de conexão e se os dois estão na mesma rede Wi-Fi.")
+                mudar(Fase.CONECTANDO, "Conectando a $h:$pc…")
+                conectarComTentativas(BotAdb.obter(), h, pc)
                 WifiDebug.iniciarSessao(app)
-                liberarDesligarSozinho(app, m)
                 mudar(Fase.CONECTADO)
             } catch (e: Exception) {
-                mudar(Fase.ERRO, e.message ?: "Não consegui conectar ao aparelho remoto.")
+                remoto = false
+                fecharSocket()
+                if (cancelado) mudar(Fase.OCIOSO) else mudar(Fase.ERRO, if (e is Aviso) (e.message ?: "Não consegui conectar ao aparelho remoto.") else traduzir(e, "conectar"))
             } finally {
                 trabalhando.set(false)
             }
@@ -260,9 +383,14 @@ object AdbWifi {
     fun conectar(ctx: Context) {
         val app = ctx.applicationContext
         if (!trabalhando.compareAndSet(false, true)) return
+        cancelado = false
+        remoto = false
         Thread {
             try { conectarInterno(app) }
-            catch (e: Exception) { mudar(Fase.ERRO, e.message ?: "Não consegui conectar. Se for a primeira vez, pareie com o código.") }
+            catch (e: Exception) {
+                if (cancelado) mudar(Fase.OCIOSO)
+                else mudar(Fase.ERRO, if (e is Aviso) (e.message ?: "Não consegui conectar. Se for a primeira vez, pareie com o código.") else traduzir(e, "conectar"))
+            }
             finally { trabalhando.set(false) }
         }.start()
     }
@@ -270,16 +398,16 @@ object AdbWifi {
     private fun conectarInterno(app: Context) {
         mudar(Fase.CONECTANDO, "Conectando…")
         val alvo = descobrir(app, TIPO_CONECTAR, 6000)
-            ?: throw Exception("Não achei a porta de conexão. Confira se a \"Depuração sem fio\" está ligada.")
+            ?: throw Aviso("Não achei a porta de conexão. Confira se a \"Depuração sem fio\" está ligada.")
         val m = BotAdb.obter()
-        val r: Any? = m.connect(alvo.first, alvo.second)
-        if (r == false) throw Exception("Não consegui conectar. Se for a primeira vez, pareie com o código.")
+        val r: Any? = comLimite(15000, "conectar") { m.connect(alvo.first, alvo.second) }
+        if (r == false) throw Aviso("Não consegui conectar. Se for a primeira vez, pareie com o código.")
         WifiDebug.iniciarSessao(app)
         liberarDesligarSozinho(app, m)
         mudar(Fase.CONECTADO)
     }
 
-    /** Uma vez conectado, o app concede a si mesmo a permissão que permite desligar a depuração sem fio. */
+    /** Uma vez conectado, o app concede a si mesmo a permissão que permite desligar a depuração sem fio (só vale neste aparelho). */
     private fun liberarDesligarSozinho(app: Context, m: BotAdb) {
         if (WifiDebug.podeDesligar(app)) return
         try {
@@ -288,14 +416,24 @@ object AdbWifi {
         } catch (e: Exception) { /* sem a permissão o app só avisa na hora de desligar */ }
     }
 
+    /** Cancela o pareamento/conexão em andamento (botão "Cancelar"). */
+    fun cancelar() {
+        cancelado = true
+        try { tarefaAtual?.cancel(true) } catch (e: Exception) { /* ok */ }
+        Thread { fecharSocket() }.start()
+        mudar(Fase.OCIOSO)
+    }
+
     /** Fecha a conexão do app (em segundo plano). */
     fun desconectar() {
+        remoto = false
         mudar(Fase.OCIOSO)
         Thread { fecharSocket() }.start()
     }
 
     /** Fecha a conexão agora. Bloqueia: chame fora da thread principal. */
     fun desconectarAgora() {
+        remoto = false
         mudar(Fase.OCIOSO)
         fecharSocket()
     }
