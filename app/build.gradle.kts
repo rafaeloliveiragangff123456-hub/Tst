@@ -18,13 +18,7 @@ android {
         versionCode = cfg("BS_VERSION_CODE", "1").toInt()
         versionName = cfg("BS_VERSION_NAME", "1.0.20")
 
-        buildConfigField("String", "SERVER_URL", "\"${cfg("BOTSYNC_URL", "https://CONFIGURE-BOTSYNC_URL.squareweb.app").trimEnd('/')}\"")
-        buildConfigField("String", "TLS_PINS", "\"${cfg("BOTSYNC_PINS")}\"")
-        buildConfigField("String", "CERT_SHA256", "\"${cfg("BOTSYNC_CERT_SHA256")}\"")
-        buildConfigField("boolean", "BLOQUEAR_ROOT", cfg("BOTSYNC_BLOQUEAR_ROOT", "true"))
     }
-
-    buildFeatures { buildConfig = true }
 
     signingConfigs {
         create("release") {
@@ -59,9 +53,5 @@ android {
 }
 
 dependencies {
-    implementation("com.google.android.gms:play-services-auth:21.2.0")   // conta Google do aparelho → token do Gmail (somente leitura)
-    // depuração por Wi-Fi dentro do app: pareamento por código + conexão (ADB)
-    implementation("com.github.MuntashirAkon:libadb-android:3.1.0")
-    implementation("com.github.MuntashirAkon:sun-security-android:1.1")
-    implementation("org.conscrypt:conscrypt-android:2.5.3")
+    // sem dependências externas: o app usa só o Android puro
 }
