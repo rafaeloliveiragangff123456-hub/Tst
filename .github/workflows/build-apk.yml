@@ -71,8 +71,6 @@ jobs:
 
       - name: Compilar release
         env:
-          BOTSYNC_URL: ${{ vars.BOTSYNC_URL }}
-          BOTSYNC_PINS: ${{ vars.BOTSYNC_PINS }}
           BS_KEYSTORE: ${{ runner.temp }}/botsync.jks
           BS_KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
           BS_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
@@ -80,11 +78,6 @@ jobs:
           BS_VERSION_CODE: ${{ env.BS_VERSION_CODE }}
           BS_VERSION_NAME: ${{ env.BS_VERSION_NAME }}
         run: |
-          if [ -z "$BOTSYNC_URL" ]; then
-            echo "::error::Defina a variável BOTSYNC_URL."
-            exit 1
-          fi
-
           gradle --no-daemon :app:assembleRelease
 
       - name: Verificar assinatura do APK
